@@ -166,7 +166,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "select",
       label: "Specialist thread notifications",
       description:
-        "Push notification level for specialist threads spawned by another thread. That thread summarizes their output, so they are muted by default. Inherit uses the Push notifications plugin's child thread setting.",
+        "Push notification level for specialist threads spawned by another thread or plugin, such as a sage. The requester summarizes their output, so they are muted by default. Inherit uses the Push notifications plugin's child thread setting.",
       options: ["muted", "input-only", "all", "inherit"],
       default: "muted",
     },
@@ -253,6 +253,8 @@ export default async function plugin(bb: BbPluginApi) {
     environmentId?: string | null;
     requestedBy?: string;
     override?: ModelOverride;
+    /** Another plugin reports the result, as a parent thread would. */
+    reportedByCaller?: boolean;
   }): Promise<string> {
     const { specialist, task } = args;
     const execution = resolveExecution(specialist, args.override ?? {});
@@ -297,7 +299,9 @@ export default async function plugin(bb: BbPluginApi) {
           : { override: args.override }),
       },
     });
-    if (parent !== null) await setChildNotifications(thread.id);
+    if (parent !== null || args.reportedByCaller === true) {
+      await setChildNotifications(thread.id);
+    }
     bb.log.info(
       `handed off to ${specialist.name} on ${describeModel(execution)}: ${thread.id}`,
     );
@@ -342,6 +346,7 @@ export default async function plugin(bb: BbPluginApi) {
         environmentId,
         requestedBy,
         ...(override === undefined ? {} : { override }),
+        reportedByCaller: true,
       });
       return { threadId };
     },
