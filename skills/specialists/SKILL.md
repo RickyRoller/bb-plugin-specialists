@@ -29,8 +29,13 @@ A mention is a request to delegate. Do not do the mentioned work yourself.
    changes, but none of this conversation. Write the brief to stand alone:
    the goal, the relevant paths, exactly what to inspect, any constraints, and
    the result you want back.
-3. Tell the user which thread took the work, as `@thread:<id>`.
-4. You are notified when the child thread finishes. Read its result with
+3. The specialist runs on its own configured model. Only when the user
+   explicitly asks for a different model, provider, or reasoning level for this
+   request, pass `model`, `provider`, or `reasoningLevel` to the tool (CLI:
+   `--model`, `--provider`, `--reasoning-level`). The change applies to that one
+   handoff. Never change the model on your own.
+4. Tell the user which thread took the work, as `@thread:<id>`.
+5. You are notified when the child thread finishes. Read its result with
    `bb thread output <id>` and relay it.
 
 ## Commands
@@ -40,7 +45,7 @@ bb specialists list [--json]
 bb specialists show <name> [--json]
 bb specialists add <name> --prompt <text> [--description <text>] [--provider <id>] [--model <id>] [--reasoning-level <level>]
 bb specialists remove <name>
-bb specialists handoff <name> --task <brief>
+bb specialists handoff <name> --task <brief> [--provider <id>] [--model <id>] [--reasoning-level <level>]
 ```
 
 - Names are lowercase letters, digits, and dashes, up to 32 characters. A
@@ -50,3 +55,7 @@ bb specialists handoff <name> --task <brief>
   heredoc, as above, so the shell does not expand backticks or `$(...)` in it.
 - Omit `--provider` and `--model` to use the project's default for new threads.
 - `handoff` must run inside a BB thread. It uses that thread as the parent.
+- `handoff --provider/--model/--reasoning-level` override the specialist's
+  saved settings for that handoff only. Omitted ones keep the saved values. A new
+  `--provider` without `--model` uses that provider's default model. Model ids
+  are not checked up front; an unknown one fails when the thread starts.

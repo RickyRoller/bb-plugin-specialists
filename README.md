@@ -40,6 +40,22 @@ bb specialists add reviewer \
 6. BB notifies the parent thread when the child finishes. The parent reads the
    result and relays it.
 
+## Overriding the model for one handoff
+
+Ask for it in the message, for example "ask the @reviewer, on Sonnet, to look
+over the unstaged changes". The agent passes the override to the handoff, and
+the specialist's saved settings stay as they are.
+
+- The tool takes optional `model`, `provider`, and `reasoningLevel`.
+- The CLI takes `--model`, `--provider`, and `--reasoning-level`.
+- The `specialists_handoff` RPC takes an optional `override` object with
+  `providerId`, `model`, and `reasoningLevel`.
+
+Omitted fields keep the specialist's values. Changing the provider without
+naming a model uses that provider's default model. Model ids are not checked
+against bb's model list, which can lag behind a provider's real models; an
+unknown id fails when the thread starts.
+
 ## Constraints
 
 - Agent tools load when a session starts. A thread that was already running

@@ -40,6 +40,34 @@ const specialistSchema = z.object({
 });
 export type Specialist = z.infer<typeof specialistSchema>;
 
+/** Per-handoff model change; omitted fields keep the specialist's own. */
+const modelOverrideSchema = z.object({
+  providerId: z.string().trim().min(1).optional(),
+  model: z.string().trim().min(1).optional(),
+  reasoningLevel: z.enum(REASONING_LEVELS).optional(),
+});
+type ModelOverride = z.infer<typeof modelOverrideSchema>;
+
+/** The execution settings a handoff runs with, after any override. */
+function resolveExecution(
+  specialist: Specialist,
+  override: ModelOverride,
+): Pick<Specialist, "providerId" | "model" | "reasoningLevel"> {
+  const providerId = override.providerId ?? specialist.providerId;
+  // A saved model belongs to the saved provider. Switching provider without
+  // naming a model falls back to that provider's default.
+  const providerChanged =
+    override.providerId !== undefined &&
+    override.providerId !== specialist.providerId;
+  const model =
+    override.model ?? (providerChanged ? null : specialist.model);
+  return {
+    providerId,
+    model,
+    reasoningLevel: override.reasoningLevel ?? specialist.reasoningLevel,
+  };
+}
+
 const modelSelectionSchema = z.object({
   providerId: z.string(),
   model: z.string(),
@@ -74,6 +102,8 @@ export const rpcContract = defineRpcContract({
       environmentId: z.string().nullable(),
       // Who is asking, as the specialist should read it, e.g. "The sage X".
       requestedBy: z.string().trim().min(1).max(200),
+      // Optional: run this one handoff on a different model.
+      override: modelOverrideSchema.optional(),
     }),
     output: z.object({ threadId: z.string() }),
   },
@@ -125,11 +155,42 @@ function mentionContext(specialist: Specialist): string {
     `The user mentioned the specialist agent @${specialist.name}${about}. This is a request to delegate: hand the work the user is describing to that specialist instead of doing it yourself.`,
     `Call the \`specialist_handoff\` tool with specialist "${specialist.name}" and a task brief. If that tool is not available in this session, run \`bb specialists handoff ${specialist.name} --task "<brief>"\`.`,
     "The specialist runs in a new thread that shares this workspace but sees none of this conversation. Write the brief to stand alone: the goal, the relevant paths, exactly what to look at (for example \"the unstaged changes, via git diff\"), any constraints, and the result you want back.",
+    "The specialist runs on its own configured model. Only if the user explicitly asks for a different model, provider, or reasoning level for this request, pass it as the tool's `model`, `provider`, or `reasoningLevel` (CLI: `--model`, `--provider`, `--reasoning-level`). Never change it on your own.",
     "After handing off, tell the user which thread is working on it, referencing it as @thread:<id>. You are notified when that thread finishes; then read its result with `bb thread output <id>` and relay it.",
   ].join("\n\n");
 }
 
 export default async function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    childNotifications: {
+      type: "select",
+      label: "Specialist thread notifications",
+      description:
+        "Push notification level for specialist threads spawned by another thread. That thread summarizes their output, so they are muted by default. Inherit uses the Push notifications plugin's child thread setting.",
+      options: ["muted", "input-only", "all", "inherit"],
+      default: "muted",
+    },
+  });
+
+  /** Applies the configured level through bb's push-notifications plugin. */
+  async function setChildNotifications(threadId: string): Promise<void> {
+    const { childNotifications: level } = await settings.get();
+    if (level === "inherit") return;
+    try {
+      await bb.sdk.plugins.callRpc({
+        pluginId: "push-notifications",
+        method: "threadNotifications.set",
+        input: { threadId, level },
+        outputSchema: z.unknown(),
+      });
+    } catch (cause) {
+      // Notifications are a nicety; never fail the handoff over them.
+      bb.log.warn(
+        `could not set notifications to ${level} on ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }
+
   async function readSpecialists(): Promise<Specialist[]> {
     // Persisted values are untrusted: drop rows that no longer parse.
     const stored = (await bb.storage.kv.get<unknown>("specialists")) ?? [];
@@ -191,8 +252,10 @@ export default async function plugin(bb: BbPluginApi) {
     /** The workspace to share when there is no parent thread. */
     environmentId?: string | null;
     requestedBy?: string;
+    override?: ModelOverride;
   }): Promise<string> {
     const { specialist, task } = args;
+    const execution = resolveExecution(specialist, args.override ?? {});
     const parent =
       args.threadId === null
         ? null
@@ -212,13 +275,13 @@ export default async function plugin(bb: BbPluginApi) {
           ? { type: "project-default" }
           : { type: "reuse", environmentId },
       ...(parent === null ? {} : { parentThreadId: parent.id }),
-      ...(specialist.providerId === null
+      ...(execution.providerId === null
         ? {}
-        : { providerId: specialist.providerId }),
-      ...(specialist.model === null ? {} : { model: specialist.model }),
-      ...(specialist.reasoningLevel === null
+        : { providerId: execution.providerId }),
+      ...(execution.model === null ? {} : { model: execution.model }),
+      ...(execution.reasoningLevel === null
         ? {}
-        : { reasoningLevel: specialist.reasoningLevel }),
+        : { reasoningLevel: execution.reasoningLevel }),
       title: handoffTitle(specialist, task),
       prompt: handoffPrompt(
         specialist,
@@ -226,15 +289,28 @@ export default async function plugin(bb: BbPluginApi) {
         parent?.id ?? null,
         args.requestedBy ?? null,
       ),
-      pluginMetadata: { specialist: specialist.name },
+      pluginMetadata: {
+        specialist: specialist.name,
+        ...(args.override === undefined ||
+        Object.keys(args.override).length === 0
+          ? {}
+          : { override: args.override }),
+      },
     });
-    bb.log.info(`handed off to ${specialist.name}: ${thread.id}`);
+    if (parent !== null) await setChildNotifications(thread.id);
+    bb.log.info(
+      `handed off to ${specialist.name} on ${describeModel(execution)}: ${thread.id}`,
+    );
     return thread.id;
   }
 
-  function handoffReceipt(specialist: Specialist, threadId: string): string {
+  function handoffReceipt(
+    specialist: Specialist,
+    threadId: string,
+    execution: Pick<Specialist, "providerId" | "model" | "reasoningLevel">,
+  ): string {
     return [
-      `Handed off to @${specialist.name} in thread ${threadId} (reference it to the user as @thread:${threadId}).`,
+      `Handed off to @${specialist.name} on ${describeModel(execution)} in thread ${threadId} (reference it to the user as @thread:${threadId}).`,
       `You are notified when it finishes. Then read its result with \`bb thread output ${threadId}\` and relay it to the user. Do not do the handed-off work yourself in the meantime.`,
     ].join("\n");
   }
@@ -252,6 +328,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectId,
       environmentId,
       requestedBy,
+      override,
     }) => {
       const specialist = await findSpecialist(name);
       if (specialist === null) {
@@ -264,6 +341,7 @@ export default async function plugin(bb: BbPluginApi) {
         projectId,
         environmentId,
         requestedBy,
+        ...(override === undefined ? {} : { override }),
       });
       return { threadId };
     },
@@ -341,8 +419,33 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "A self-contained brief. The specialist sees this workspace but none of this conversation: give the goal, relevant paths, what to inspect, constraints, and the result you want back.",
         ),
+      model: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Only when the user explicitly asks for it: a model id for this handoff only (see `bb provider models <provider>`). Omit to use the specialist's model.",
+        ),
+      provider: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Only when the user explicitly asks for it: a provider id for this handoff only (see `bb provider list`). Omit to keep the specialist's provider.",
+        ),
+      reasoningLevel: z
+        .enum(REASONING_LEVELS)
+        .optional()
+        .describe(
+          "Only when the user explicitly asks for it: a reasoning level for this handoff only. Omit to use the specialist's.",
+        ),
     }),
-    async execute({ specialist: name, task }, { threadId, projectId }) {
+    async execute(
+      { specialist: name, task, model, provider, reasoningLevel },
+      { threadId, projectId },
+    ) {
       const specialist = await findSpecialist(name);
       if (specialist === null) {
         return {
@@ -352,12 +455,29 @@ export default async function plugin(bb: BbPluginApi) {
           isError: true,
         };
       }
-      const childId = await handoff({ specialist, task, threadId, projectId });
-      return handoffReceipt(specialist, childId);
+      const override = {
+        ...(provider === undefined ? {} : { providerId: provider }),
+        ...(model === undefined ? {} : { model }),
+        ...(reasoningLevel === undefined ? {} : { reasoningLevel }),
+      };
+      const childId = await handoff({
+        specialist,
+        task,
+        threadId,
+        projectId,
+        override,
+      });
+      return handoffReceipt(
+        specialist,
+        childId,
+        resolveExecution(specialist, override),
+      );
     },
   });
 
-  function describeModel(specialist: Specialist): string {
+  function describeModel(
+    specialist: Pick<Specialist, "providerId" | "model" | "reasoningLevel">,
+  ): string {
     if (specialist.model === null) return "project default";
     const provider =
       specialist.providerId === null ? "" : `${specialist.providerId}/`;
@@ -514,6 +634,23 @@ export default async function plugin(bb: BbPluginApi) {
               aliases: ["prompt", "brief"],
               required: true,
             },
+            provider: {
+              type: "string",
+              description:
+                "Provider id for this handoff only; omit to keep the specialist's",
+            },
+            model: {
+              type: "string",
+              description:
+                "Model id for this handoff only; omit to use the specialist's (a new --provider without --model uses that provider's default)",
+            },
+            "reasoning-level": {
+              type: "enum",
+              values: REASONING_LEVELS,
+              aliases: ["reasoning", "effort"],
+              description:
+                "Reasoning level for this handoff only; omit to use the specialist's",
+            },
             json: jsonOption,
           },
           async run(input, ctx) {
@@ -534,17 +671,30 @@ export default async function plugin(bb: BbPluginApi) {
                 },
               );
             }
+            const { provider, model } = input.options;
+            const reasoningLevel = input.options["reasoning-level"];
+            const override = {
+              ...(provider === undefined ? {} : { providerId: provider }),
+              ...(model === undefined ? {} : { model }),
+              ...(reasoningLevel === undefined ? {} : { reasoningLevel }),
+            };
             const threadId = await handoff({
               specialist,
               task,
               threadId: ctx.threadId ?? null,
               projectId: ctx.projectId ?? null,
+              override,
             });
+            const execution = resolveExecution(specialist, override);
             return {
               exitCode: 0,
               stdout: input.options.json
-                ? JSON.stringify({ threadId, specialist: specialist.name })
-                : handoffReceipt(specialist, threadId),
+                ? JSON.stringify({
+                    threadId,
+                    specialist: specialist.name,
+                    ...execution,
+                  })
+                : handoffReceipt(specialist, threadId, execution),
             };
           },
         }),
