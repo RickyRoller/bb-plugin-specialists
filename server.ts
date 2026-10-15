@@ -59,8 +59,7 @@ function resolveExecution(
   const providerChanged =
     override.providerId !== undefined &&
     override.providerId !== specialist.providerId;
-  const model =
-    override.model ?? (providerChanged ? null : specialist.model);
+  const model = override.model ?? (providerChanged ? null : specialist.model);
   return {
     providerId,
     model,
@@ -73,6 +72,27 @@ const modelSelectionSchema = z.object({
   model: z.string(),
   reasoningLevel: z.enum(REASONING_LEVELS),
 });
+
+const handoffInputSchema = z.object({
+  specialist: z.string(),
+  task: z.string().trim().min(1).max(100_000),
+  projectId: z.string(),
+  // The workspace to share; null runs in the project's default.
+  environmentId: z.string().nullable(),
+  // Who is asking, as the specialist should read it, e.g. "The sage X".
+  requestedBy: z.string().trim().min(1).max(200),
+  // Optional plugin-owned parent and recovery identity (e.g. an Envoy PR).
+  parentThreadId: z.string().optional(),
+  handoffKey: z.string().min(1).max(200).optional(),
+  // Optional: run this one handoff on a different model.
+  override: modelOverrideSchema.optional(),
+});
+const keyedHandoffResultSchema = z.object({
+  status: z.enum(["started", "failed", "uncertain"]),
+  threadId: z.string().nullable(),
+  error: z.string().nullable(),
+});
+type KeyedHandoffResult = z.infer<typeof keyedHandoffResultSchema>;
 
 export const rpcContract = defineRpcContract({
   specialists_list: {
@@ -94,18 +114,22 @@ export const rpcContract = defineRpcContract({
   // For other plugins: hands work to a specialist in a thread with no
   // parent. The caller tracks the returned thread and reads its result.
   specialists_handoff: {
-    input: z.object({
-      specialist: z.string(),
-      task: z.string().trim().min(1).max(100_000),
-      projectId: z.string(),
-      // The workspace to share; null runs in the project's default.
-      environmentId: z.string().nullable(),
-      // Who is asking, as the specialist should read it, e.g. "The sage X".
-      requestedBy: z.string().trim().min(1).max(200),
-      // Optional: run this one handoff on a different model.
-      override: modelOverrideSchema.optional(),
-    }),
+    input: handoffInputSchema,
     output: z.object({ threadId: z.string() }),
+  },
+  // Versioned, idempotent handoff used by Envoy readiness monitors.
+  specialists_handoff_capabilities: {
+    input: z.null(),
+    output: z.object({ keyedHandoffVersion: z.literal(1) }),
+  },
+  specialists_handoff_keyed: {
+    input: handoffInputSchema.extend({
+      handoffKey: z.string().min(1).max(200),
+      parentThreadId: z.string(),
+      // Explicit user-confirmed recovery after a fresh search finds no worker.
+      relaunchUncertain: z.boolean().default(false),
+    }),
+    output: keyedHandoffResultSchema,
   },
   // Seeds the model picker for a new specialist.
   default_model: {
@@ -154,7 +178,7 @@ function mentionContext(specialist: Specialist): string {
   return [
     `The user mentioned the specialist agent @${specialist.name}${about}. This is a request to delegate: hand the work the user is describing to that specialist instead of doing it yourself.`,
     `Call the \`specialist_handoff\` tool with specialist "${specialist.name}" and a task brief. If that tool is not available in this session, run \`bb specialists handoff ${specialist.name} --task "<brief>"\`.`,
-    "The specialist runs in a new thread that shares this workspace but sees none of this conversation. Write the brief to stand alone: the goal, the relevant paths, exactly what to look at (for example \"the unstaged changes, via git diff\"), any constraints, and the result you want back.",
+    'The specialist runs in a new thread that shares this workspace but sees none of this conversation. Write the brief to stand alone: the goal, the relevant paths, exactly what to look at (for example "the unstaged changes, via git diff"), any constraints, and the result you want back.',
     "The specialist runs on its own configured model. Only if the user explicitly asks for a different model, provider, or reasoning level for this request, pass it as the tool's `model`, `provider`, or `reasoningLevel` (CLI: `--model`, `--provider`, `--reasoning-level`). Never change it on your own.",
     "After handing off, tell the user which thread is working on it, referencing it as @thread:<id>. You are notified when that thread finishes; then read its result with `bb thread output <id>` and relay it.",
   ].join("\n\n");
@@ -255,6 +279,8 @@ export default async function plugin(bb: BbPluginApi) {
     override?: ModelOverride;
     /** Another plugin reports the result, as a parent thread would. */
     reportedByCaller?: boolean;
+    handoffKey?: string;
+    beforeSpawn?: () => void;
   }): Promise<string> {
     const { specialist, task } = args;
     const execution = resolveExecution(specialist, args.override ?? {});
@@ -268,8 +294,8 @@ export default async function plugin(bb: BbPluginApi) {
         "A handoff needs a thread or project to run in. Run it from a BB thread.",
       );
     }
-    const environmentId =
-      parent?.environmentId ?? args.environmentId ?? null;
+    const environmentId = parent?.environmentId ?? args.environmentId ?? null;
+    args.beforeSpawn?.();
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment:
@@ -284,6 +310,13 @@ export default async function plugin(bb: BbPluginApi) {
       ...(execution.reasoningLevel === null
         ? {}
         : { reasoningLevel: execution.reasoningLevel }),
+      executionInputSources: {
+        ...(execution.providerId ? { providerId: "explicit" as const } : {}),
+        ...(execution.model ? { model: "explicit" as const } : {}),
+        ...(execution.reasoningLevel
+          ? { reasoningLevel: "explicit" as const }
+          : {}),
+      },
       title: handoffTitle(specialist, task),
       prompt: handoffPrompt(
         specialist,
@@ -293,6 +326,9 @@ export default async function plugin(bb: BbPluginApi) {
       ),
       pluginMetadata: {
         specialist: specialist.name,
+        ...(args.handoffKey === undefined
+          ? {}
+          : { handoffKey: args.handoffKey }),
         ...(args.override === undefined ||
         Object.keys(args.override).length === 0
           ? {}
@@ -319,7 +355,139 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
+  const handoffDb = bb.storage.database();
+  handoffDb.exec(
+    "CREATE TABLE IF NOT EXISTS keyed_handoffs (key TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT NOT NULL, status TEXT NOT NULL, thread_id TEXT, error TEXT)",
+  );
+  const handoffQueues = new Map<string, Promise<KeyedHandoffResult>>();
+  async function findKeyedWorker(projectId: string, key: string) {
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += 100) {
+        const threads = await bb.sdk.threads.list({
+          projectId,
+          originPluginId: "specialists",
+          includeHidden: true,
+          archived,
+          limit: 100,
+          offset,
+        });
+        if (!threads.length) break;
+        const batch = await bb.sdk.threads.experimental_listPluginMetadata({
+          pluginId: "specialists",
+          threadIds: threads.map((t) => t.id),
+        });
+        const match = batch.threads.find((t) => t.metadata.handoffKey === key);
+        if (match) return match.threadId;
+        if (threads.length < 100) break;
+      }
+    }
+    return null;
+  }
+  function keyedHandoff(
+    input: z.infer<typeof handoffInputSchema> & {
+      handoffKey: string;
+      parentThreadId: string;
+      relaunchUncertain: boolean;
+    },
+  ): Promise<KeyedHandoffResult> {
+    const { handoffKey: key, projectId, parentThreadId } = input;
+    const run = async (): Promise<KeyedHandoffResult> => {
+      const stored = handoffDb
+        .prepare("SELECT * FROM keyed_handoffs WHERE key=?")
+        .get(key) as
+        | {
+            project_id: string;
+            parent_id: string;
+            status: string;
+            thread_id: string | null;
+            error: string | null;
+          }
+        | undefined;
+      if (
+        stored &&
+        (stored.project_id !== projectId || stored.parent_id !== parentThreadId)
+      )
+        throw new Error("That handoff key belongs to a different task");
+      const save = (
+        status: "reserved" | KeyedHandoffResult["status"],
+        threadId: string | null,
+        error: string | null,
+      ) => {
+        handoffDb
+          .prepare(
+            "INSERT INTO keyed_handoffs (key,project_id,parent_id,status,thread_id,error) VALUES (?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET status=excluded.status,thread_id=excluded.thread_id,error=excluded.error",
+          )
+          .run(key, projectId, parentThreadId, status, threadId, error);
+      };
+      if (stored?.status === "started")
+        return { status: "started", threadId: stored.thread_id, error: null };
+      const previous = await findKeyedWorker(projectId, key);
+      if (previous) {
+        save("started", previous, null);
+        return { status: "started", threadId: previous, error: null };
+      }
+      if (stored?.status === "uncertain" && !input.relaunchUncertain)
+        return {
+          status: "uncertain",
+          threadId: null,
+          error:
+            "The spawn outcome is unconfirmed. Recovery found no worker yet; no duplicate will be launched.",
+        };
+      save("reserved", null, null);
+      let spawnAttempted = false;
+      try {
+        const specialist = await findSpecialist(input.specialist);
+        if (!specialist)
+          throw new Error(await unknownSpecialistMessage(input.specialist));
+        const threadId = await handoff({
+          specialist,
+          task: input.task,
+          threadId: parentThreadId,
+          projectId,
+          environmentId: input.environmentId,
+          requestedBy: input.requestedBy,
+          override: input.override,
+          handoffKey: key,
+          reportedByCaller: true,
+          beforeSpawn() {
+            spawnAttempted = true;
+            save("uncertain", null, null);
+          },
+        });
+        save("started", threadId, null);
+        return { status: "started", threadId, error: null };
+      } catch (error) {
+        const value = error as {
+          status?: unknown;
+          statusCode?: unknown;
+        } | null;
+        const rejected =
+          error instanceof z.ZodError ||
+          (value &&
+            [400, 401, 403, 404, 409, 422].includes(
+              Number(value.status ?? value.statusCode),
+            ));
+        const status = !spawnAttempted || rejected ? "failed" : "uncertain";
+        const message = error instanceof Error ? error.message : String(error);
+        save(status, null, message);
+        return { status, threadId: null, error: message };
+      }
+    };
+    const next = (handoffQueues.get(key) ?? Promise.resolve()).then(run, run);
+    handoffQueues.set(key, next);
+    void next
+      .finally(() => {
+        if (handoffQueues.get(key) === next) handoffQueues.delete(key);
+      })
+      .catch(() => {});
+    return next;
+  }
+
   bb.rpc.register(rpcContract, {
+    specialists_handoff_capabilities: () => ({
+      keyedHandoffVersion: 1 as const,
+    }),
+    specialists_handoff_keyed: keyedHandoff,
     specialists_list: async () => ({ specialists: await readSpecialists() }),
     specialists_save: ({ specialist, replaces }) =>
       saveSpecialist(specialist, replaces),
@@ -332,6 +500,8 @@ export default async function plugin(bb: BbPluginApi) {
       projectId,
       environmentId,
       requestedBy,
+      parentThreadId,
+      handoffKey,
       override,
     }) => {
       const specialist = await findSpecialist(name);
@@ -341,10 +511,11 @@ export default async function plugin(bb: BbPluginApi) {
       const threadId = await handoff({
         specialist,
         task,
-        threadId: null,
+        threadId: parentThreadId ?? null,
         projectId,
         environmentId,
         requestedBy,
+        handoffKey,
         ...(override === undefined ? {} : { override }),
         reportedByCaller: true,
       });
@@ -487,7 +658,9 @@ export default async function plugin(bb: BbPluginApi) {
     const provider =
       specialist.providerId === null ? "" : `${specialist.providerId}/`;
     const reasoning =
-      specialist.reasoningLevel === null ? "" : ` (${specialist.reasoningLevel})`;
+      specialist.reasoningLevel === null
+        ? ""
+        : ` (${specialist.reasoningLevel})`;
     return `${provider}${specialist.model}${reasoning}`;
   }
   async function requireSpecialist(rawName: string): Promise<Specialist> {
@@ -563,7 +736,8 @@ export default async function plugin(bb: BbPluginApi) {
           options: {
             description: {
               type: "string",
-              description: "One line on what the specialist is for (max 300 chars)",
+              description:
+                "One line on what the specialist is for (max 300 chars)",
               default: "",
             },
             prompt: {
@@ -574,11 +748,13 @@ export default async function plugin(bb: BbPluginApi) {
             },
             provider: {
               type: "string",
-              description: "Provider id (see `bb provider list`); omit for the project default",
+              description:
+                "Provider id (see `bb provider list`); omit for the project default",
             },
             model: {
               type: "string",
-              description: "Model id (see `bb provider models`); omit for the project default",
+              description:
+                "Model id (see `bb provider models`); omit for the project default",
             },
             "reasoning-level": {
               type: "enum",
