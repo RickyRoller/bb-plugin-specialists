@@ -76,3 +76,26 @@ npx tsc --noEmit       # typecheck
   CLI.
 - `app.tsx` holds the Specialists page.
 - `skills/specialists/SKILL.md` tells agents how to hand off.
+
+
+The `specialists_handoff` RPC also accepts optional `parentThreadId` and
+`handoffKey` fields for plugin-owned work. A parent shares its workspace and
+receives normal child reporting; the recovery key is stored in the child's
+Specialists metadata so the caller can recover an interrupted response.
+Existing callers may omit both fields.
+
+
+For durable task handoffs, `specialists_handoff_capabilities` returns
+`keyedHandoffVersion: 1`. `specialists_handoff_keyed` takes the ordinary handoff
+fields plus required `parentThreadId` and `handoffKey`. It returns
+`{ status: "started" | "failed" | "uncertain", threadId, error }`.
+Concurrent and repeated requests share one persisted launch record. Definite
+rejections can retry; uncertain spawns recover metadata and never launch a second
+worker. A key belongs to one project/parent pair. Callers should pause automatic
+polling on failures and offer explicit recovery. The generic `specialists_handoff`
+RPC keeps its existing output and remains compatible with prior callers.
+
+A keyed handoff with an unconfirmed spawn normally only searches for the original
+worker. `relaunchUncertain: true` is reserved for explicit user-confirmed recovery:
+it searches again and permits a new spawn only if no worker is found. A delayed
+original request may still create a duplicate; never set it on automatic retries.

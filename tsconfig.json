@@ -22,6 +22,7 @@
   },
   "include": [
     "server.ts",
+    "keyed-handoff.test.ts",
     "app.tsx",
     "components",
     "lib",
