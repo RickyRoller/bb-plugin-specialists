@@ -101,7 +101,10 @@ test("keyed handoff serializes concurrent retries, records parent/key and execut
     )[0]![0] as any;
     assert.equal(args.parentThreadId, "parent-1");
     assert.equal(args.pluginMetadata.handoffKey, input.handoffKey);
+    // Saved without a permission mode, so it defaults to full access.
+    assert.equal(args.permissionMode, "full");
     assert.deepEqual(args.executionInputSources, {
+      permissionMode: "explicit",
       providerId: "explicit",
       model: "explicit",
       reasoningLevel: "explicit",

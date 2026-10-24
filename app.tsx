@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
   definePluginApp,
+  experimental_PermissionModePicker as PermissionModePicker,
   experimental_ProviderModelPicker as ProviderModelPicker,
   useRealtime,
   useRpc,
@@ -99,6 +100,9 @@ function SpecialistDialog({
     useState<ExperimentalProviderModelPickerValue | null>(
       editing === null ? null : pickerValue(editing),
     );
+  const [permissionMode, setPermissionMode] = useState<
+    Specialist["permissionMode"]
+  >(editing?.permissionMode ?? "full");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -137,6 +141,7 @@ function SpecialistDialog({
           providerId: model?.providerId ?? null,
           model: model?.model ?? null,
           reasoningLevel: reasoningLevel satisfies StoredReasoningLevel | null,
+          permissionMode,
         },
         replaces: editing?.name ?? null,
       });
@@ -205,6 +210,24 @@ function SpecialistDialog({
               <ProviderModelPicker value={model} onChange={setModel} />
             )}
           </div>
+          <div className="space-y-1.5">
+            <span className="block text-sm font-medium">Permissions</span>
+            {model === null ? (
+              <p className="text-sm text-muted-foreground">
+                {permissionMode === "full" ? "Full access" : permissionMode}
+              </p>
+            ) : (
+              <PermissionModePicker
+                providerId={model.providerId}
+                value={permissionMode}
+                onChange={setPermissionMode}
+                align="start"
+              />
+            )}
+            <span className="block text-xs text-muted-foreground">
+              What the specialist's thread may do without asking.
+            </span>
+          </div>
           {error === null ? null : (
             <p role="alert" className="text-sm text-destructive">
               {error}
@@ -256,7 +279,7 @@ function SpecialistRow({
         aria-label={`Edit ${specialist.name}`}
         onClick={onEdit}
       >
-        <Icon name="Pencil" className="size-4" />
+        <Icon name="Edit" className="size-4" />
       </Button>
       <Button
         variant="ghost"

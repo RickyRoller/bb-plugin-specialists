@@ -43,7 +43,7 @@ A mention is a request to delegate. Do not do the mentioned work yourself.
 ```
 bb specialists list [--json]
 bb specialists show <name> [--json]
-bb specialists add <name> --prompt <text> [--description <text>] [--provider <id>] [--model <id>] [--reasoning-level <level>]
+bb specialists add <name> --prompt <text> [--description <text>] [--provider <id>] [--model <id>] [--reasoning-level <level>] [--permission-mode full|auto|accept-edits]
 bb specialists remove <name>
 bb specialists handoff <name> --task <brief> [--provider <id>] [--model <id>] [--reasoning-level <level>]
 ```

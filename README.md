@@ -25,6 +25,10 @@ bb specialists add reviewer \
   --prompt "$(cat reviewer-prompt.md)"
 ```
 
+Each specialist also has a permission mode: `full` (the default), `auto`, or
+`accept-edits`. It sets what the specialist's thread may do without asking. Set
+it in the dialog's **Permissions** picker or with `--permission-mode`.
+
 ## What a mention does
 
 1. The `@` menu in the composer lists specialists under **Specialists**.
@@ -62,7 +66,8 @@ unknown id fails when the thread starts.
   when you installed the plugin uses the CLI fallback until its session
   restarts.
 - The specialist shares the parent's workspace and can edit the same files.
-  Say so in the specialist's prompt if it should only read.
+  It runs with full access unless you pick a narrower permission mode. Say so
+  in the specialist's prompt if it should only read.
 - The specialist sees none of the parent's conversation, only the task brief.
 
 ## Develop

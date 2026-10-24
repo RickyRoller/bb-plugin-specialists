@@ -19,6 +19,7 @@ import {
 import { z } from "zod";
 
 const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const PERMISSION_MODES = ["full", "auto", "accept-edits"] as const;
 
 /** Lowercase so `@reviewer` reads naturally and doubles as the stable id. */
 const nameSchema = z
@@ -37,6 +38,9 @@ const specialistSchema = z.object({
   providerId: z.string().min(1).nullable(),
   model: z.string().min(1).nullable(),
   reasoningLevel: z.enum(REASONING_LEVELS).nullable(),
+  // What the specialist's thread may do without asking. Rows saved before
+  // this setting existed parse as full access.
+  permissionMode: z.enum(PERMISSION_MODES).default("full"),
 });
 export type Specialist = z.infer<typeof specialistSchema>;
 
@@ -310,7 +314,9 @@ export default async function plugin(bb: BbPluginApi) {
       ...(execution.reasoningLevel === null
         ? {}
         : { reasoningLevel: execution.reasoningLevel }),
+      permissionMode: specialist.permissionMode,
       executionInputSources: {
+        permissionMode: "explicit" as const,
         ...(execution.providerId ? { providerId: "explicit" as const } : {}),
         ...(execution.model ? { model: "explicit" as const } : {}),
         ...(execution.reasoningLevel
@@ -704,7 +710,7 @@ export default async function plugin(bb: BbPluginApi) {
                   : specialists
                       .map(
                         (each) =>
-                          `@${each.name}  [${describeModel(each)}]  ${each.description}`,
+                          `@${each.name}  [${describeModel(each)}, ${each.permissionMode}]  ${each.description}`,
                       )
                       .join("\n"),
             };
@@ -724,6 +730,7 @@ export default async function plugin(bb: BbPluginApi) {
                     `@${specialist.name}`,
                     `Description: ${specialist.description}`,
                     `Model: ${describeModel(specialist)}`,
+                    `Permissions: ${specialist.permissionMode}`,
                     "",
                     specialist.prompt,
                   ].join("\n"),
@@ -762,6 +769,14 @@ export default async function plugin(bb: BbPluginApi) {
               aliases: ["reasoning", "effort"],
               description: "Reasoning level; omit for the model default",
             },
+            "permission-mode": {
+              type: "enum",
+              values: PERMISSION_MODES,
+              aliases: ["permissions"],
+              description:
+                "What the specialist's thread may do without asking",
+              default: "full",
+            },
             json: jsonOption,
           },
           async run(input) {
@@ -772,6 +787,7 @@ export default async function plugin(bb: BbPluginApi) {
               providerId: input.options.provider ?? null,
               model: input.options.model ?? null,
               reasoningLevel: input.options["reasoning-level"] ?? null,
+              permissionMode: input.options["permission-mode"],
             });
             if (!parsed.success) {
               throw new PluginCliError(
