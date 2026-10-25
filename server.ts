@@ -8,7 +8,8 @@
 // Mentioning a specialist attaches agent-only context telling the mentioning
 // thread to hand the work off. The handoff spawns a child thread on the
 // specialist's model, in the mentioning thread's workspace, so the specialist
-// sees the same files and uncommitted changes.
+// sees the same files and uncommitted changes. A specialist pinned to another
+// machine (or a handoff sent to one) gets a fresh workspace on that machine.
 import {
   PluginCliError,
   cliCommand,
@@ -41,6 +42,8 @@ const specialistSchema = z.object({
   // What the specialist's thread may do without asking. Rows saved before
   // this setting existed parse as full access.
   permissionMode: z.enum(PERMISSION_MODES).default("full"),
+  // The machine (host id) it runs on. null follows the requester's machine.
+  hostId: z.string().min(1).nullable().default(null),
 });
 export type Specialist = z.infer<typeof specialistSchema>;
 
@@ -90,6 +93,8 @@ const handoffInputSchema = z.object({
   handoffKey: z.string().min(1).max(200).optional(),
   // Optional: run this one handoff on a different model.
   override: modelOverrideSchema.optional(),
+  // Optional: run this one handoff on this machine (id or name).
+  machine: z.string().trim().min(1).optional(),
 });
 const keyedHandoffResultSchema = z.object({
   status: z.enum(["started", "failed", "uncertain"]),
@@ -135,6 +140,13 @@ export const rpcContract = defineRpcContract({
     }),
     output: keyedHandoffResultSchema,
   },
+  // Feeds the machine picker on the Specialists page.
+  machines_list: {
+    input: z.null(),
+    output: z.object({
+      machines: z.array(z.object({ id: z.string(), name: z.string() })),
+    }),
+  },
   // Seeds the model picker for a new specialist.
   default_model: {
     input: z.null(),
@@ -162,11 +174,14 @@ function handoffPrompt(
   task: string,
   parentThreadId: string | null,
   requestedBy: string | null = null,
+  machineName: string | null = null,
 ): string {
   const from =
-    parentThreadId !== null
-      ? `Thread ${parentThreadId} handed you the task below. You share its workspace, so its files and uncommitted changes are visible to you.`
-      : `${requestedBy ?? "A user"} handed you the task below.`;
+    machineName !== null
+      ? `${parentThreadId !== null ? `Thread ${parentThreadId}` : (requestedBy ?? "A user")} handed you the task below. You run on the machine "${machineName}", in a fresh workspace there, so you do not see the requester's uncommitted changes.`
+      : parentThreadId !== null
+        ? `Thread ${parentThreadId} handed you the task below. You share its workspace, so its files and uncommitted changes are visible to you.`
+        : `${requestedBy ?? "A user"} handed you the task below.`;
   return [
     specialist.prompt,
     "---",
@@ -184,6 +199,7 @@ function mentionContext(specialist: Specialist): string {
     `Call the \`specialist_handoff\` tool with specialist "${specialist.name}" and a task brief. If that tool is not available in this session, run \`bb specialists handoff ${specialist.name} --task "<brief>"\`.`,
     'The specialist runs in a new thread that shares this workspace but sees none of this conversation. Write the brief to stand alone: the goal, the relevant paths, exactly what to look at (for example "the unstaged changes, via git diff"), any constraints, and the result you want back.',
     "The specialist runs on its own configured model. Only if the user explicitly asks for a different model, provider, or reasoning level for this request, pass it as the tool's `model`, `provider`, or `reasoningLevel` (CLI: `--model`, `--provider`, `--reasoning-level`). Never change it on your own.",
+    "It also runs on its configured machine, or this thread's machine if it has none. Only if the user names a machine for this request, pass it as the tool's `machine` (CLI: `--machine`); list machines with `bb machine list`. On another machine the specialist gets a fresh workspace and does not see this one's uncommitted changes.",
     "After handing off, tell the user which thread is working on it, referencing it as @thread:<id>. You are notified when that thread finishes; then read its result with `bb thread output <id>` and relay it.",
   ].join("\n\n");
 }
@@ -271,6 +287,22 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  /** Resolves a machine id or unambiguous name (case-insensitive). */
+  async function resolveMachine(raw: string): Promise<{ id: string; name: string }> {
+    const hosts = await bb.sdk.hosts.list();
+    const exact = hosts.find((host) => host.id === raw);
+    if (exact) return { id: exact.id, name: exact.name };
+    const needle = raw.trim().toLowerCase();
+    const named = hosts.filter((host) => host.name.toLowerCase() === needle);
+    if (named.length === 1) return { id: named[0]!.id, name: named[0]!.name };
+    const available = hosts.map((host) => `${host.name} (${host.id})`).join(", ");
+    throw new Error(
+      named.length > 1
+        ? `More than one machine is named "${raw}". Use its id: ${available}.`
+        : `No machine "${raw}". Available: ${available}.`,
+    );
+  }
+
   /** Spawns the specialist's thread and returns its id. */
   async function handoff(args: {
     specialist: Specialist;
@@ -281,6 +313,8 @@ export default async function plugin(bb: BbPluginApi) {
     environmentId?: string | null;
     requestedBy?: string;
     override?: ModelOverride;
+    /** Machine id or name for this handoff; overrides the specialist's. */
+    machine?: string;
     /** Another plugin reports the result, as a parent thread would. */
     reportedByCaller?: boolean;
     handoffKey?: string;
@@ -299,13 +333,38 @@ export default async function plugin(bb: BbPluginApi) {
       );
     }
     const environmentId = parent?.environmentId ?? args.environmentId ?? null;
+    const requested = args.machine ?? specialist.hostId;
+    const machine = requested === null ? null : await resolveMachine(requested);
+    const shared =
+      machine === null || environmentId === null
+        ? null
+        : await bb.sdk.environments.get({ environmentId });
+    // Another machine cannot reuse this workspace, so start the same kind of
+    // workspace there: personal, a worktree of the default branch, or the
+    // project's checkout on that machine.
+    const crossMachine =
+      machine !== null && (shared === null || shared.hostId !== machine.id);
+    const environment = !crossMachine
+      ? environmentId === null
+        ? { type: "project-default" as const }
+        : { type: "reuse" as const, environmentId }
+      : {
+          type: "host" as const,
+          hostId: machine.id,
+          workspace:
+            shared?.environmentProviderId === "personal-workspace"
+              ? { type: "personal" as const }
+              : shared?.isWorktree
+                ? {
+                    type: "managed-worktree" as const,
+                    baseBranch: { kind: "default" as const },
+                  }
+                : { type: "unmanaged" as const, path: null },
+        };
     args.beforeSpawn?.();
     const thread = await bb.sdk.threads.spawn({
       projectId,
-      environment:
-        environmentId === null
-          ? { type: "project-default" }
-          : { type: "reuse", environmentId },
+      environment,
       ...(parent === null ? {} : { parentThreadId: parent.id }),
       ...(execution.providerId === null
         ? {}
@@ -329,9 +388,11 @@ export default async function plugin(bb: BbPluginApi) {
         task,
         parent?.id ?? null,
         args.requestedBy ?? null,
+        crossMachine ? machine.name : null,
       ),
       pluginMetadata: {
         specialist: specialist.name,
+        ...(machine === null ? {} : { hostId: machine.id }),
         ...(args.handoffKey === undefined
           ? {}
           : { handoffKey: args.handoffKey }),
@@ -345,7 +406,7 @@ export default async function plugin(bb: BbPluginApi) {
       await setChildNotifications(thread.id);
     }
     bb.log.info(
-      `handed off to ${specialist.name} on ${describeModel(execution)}: ${thread.id}`,
+      `handed off to ${specialist.name} on ${describeModel(execution)}${machine === null ? "" : ` on ${machine.name}`}: ${thread.id}`,
     );
     return thread.id;
   }
@@ -453,6 +514,7 @@ export default async function plugin(bb: BbPluginApi) {
           environmentId: input.environmentId,
           requestedBy: input.requestedBy,
           override: input.override,
+          machine: input.machine,
           handoffKey: key,
           reportedByCaller: true,
           beforeSpawn() {
@@ -509,6 +571,7 @@ export default async function plugin(bb: BbPluginApi) {
       parentThreadId,
       handoffKey,
       override,
+      machine,
     }) => {
       const specialist = await findSpecialist(name);
       if (specialist === null) {
@@ -523,10 +586,17 @@ export default async function plugin(bb: BbPluginApi) {
         requestedBy,
         handoffKey,
         ...(override === undefined ? {} : { override }),
+        ...(machine === undefined ? {} : { machine }),
         reportedByCaller: true,
       });
       return { threadId };
     },
+    machines_list: async () => ({
+      machines: (await bb.sdk.hosts.list()).map((host) => ({
+        id: host.id,
+        name: host.name,
+      })),
+    }),
     default_model: async () => {
       const providers = await bb.sdk.providers.list();
       const provider =
@@ -581,7 +651,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "specialist_handoff",
     description:
-      "Hand work off to a specialist agent. Spawns a child thread that runs the specialist on its own model in this thread's workspace, and returns that thread's id. Use it when the user @mentions a specialist or asks for one by name.",
+      "Hand work off to a specialist agent. Spawns a child thread that runs the specialist on its own model in this thread's workspace (or a fresh one when it runs on another machine), and returns that thread's id. Use it when the user @mentions a specialist or asks for one by name.",
     presentation: {
       label: {
         pending: "Handing off to specialist",
@@ -623,9 +693,17 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "Only when the user explicitly asks for it: a reasoning level for this handoff only. Omit to use the specialist's.",
         ),
+      machine: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Only when the user names one: the machine id or name to run this handoff on (see `bb machine list`). Omit to use the specialist's machine, or this thread's.",
+        ),
     }),
     async execute(
-      { specialist: name, task, model, provider, reasoningLevel },
+      { specialist: name, task, model, provider, reasoningLevel, machine },
       { threadId, projectId },
     ) {
       const specialist = await findSpecialist(name);
@@ -648,6 +726,7 @@ export default async function plugin(bb: BbPluginApi) {
         threadId,
         projectId,
         override,
+        ...(machine === undefined ? {} : { machine }),
       });
       return handoffReceipt(
         specialist,
@@ -683,6 +762,21 @@ export default async function plugin(bb: BbPluginApi) {
     type: "boolean",
     description: "Emit machine-readable JSON",
   } as const;
+  async function machineLabel(hostId: string | null): Promise<string> {
+    if (hostId === null) return "requester's machine";
+    const hosts = await bb.sdk.hosts.list();
+    return hosts.find((host) => host.id === hostId)?.name ?? `${hostId} (missing)`;
+  }
+  async function requireMachine(raw: string): Promise<{ id: string; name: string }> {
+    try {
+      return await resolveMachine(raw);
+    } catch (cause) {
+      throw new PluginCliError(cause instanceof Error ? cause.message : String(cause), {
+        code: "machine_not_found",
+        hint: "Run `bb machine list` to see machine names and ids.",
+      });
+    }
+  }
   const nameArg = {
     name: "name",
     description: "Specialist name (a leading @ is ignored)",
@@ -707,12 +801,14 @@ export default async function plugin(bb: BbPluginApi) {
               stdout:
                 specialists.length === 0
                   ? "No specialists. Add one on the Specialists page or with `bb specialists add`."
-                  : specialists
-                      .map(
-                        (each) =>
-                          `@${each.name}  [${describeModel(each)}, ${each.permissionMode}]  ${each.description}`,
+                  : (
+                      await Promise.all(
+                        specialists.map(
+                          async (each) =>
+                            `@${each.name}  [${describeModel(each)}, ${each.permissionMode}${each.hostId === null ? "" : `, on ${await machineLabel(each.hostId)}`}]  ${each.description}`,
+                        ),
                       )
-                      .join("\n"),
+                    ).join("\n"),
             };
           },
         }),
@@ -731,6 +827,7 @@ export default async function plugin(bb: BbPluginApi) {
                     `Description: ${specialist.description}`,
                     `Model: ${describeModel(specialist)}`,
                     `Permissions: ${specialist.permissionMode}`,
+                    `Machine: ${await machineLabel(specialist.hostId)}`,
                     "",
                     specialist.prompt,
                   ].join("\n"),
@@ -777,9 +874,19 @@ export default async function plugin(bb: BbPluginApi) {
                 "What the specialist's thread may do without asking",
               default: "full",
             },
+            machine: {
+              type: "string",
+              aliases: ["host"],
+              description:
+                "Machine id or name to run on (see `bb machine list`); omit to follow the requester's machine",
+            },
             json: jsonOption,
           },
           async run(input) {
+            const machine =
+              input.options.machine === undefined
+                ? null
+                : await requireMachine(input.options.machine);
             const parsed = specialistSchema.safeParse({
               name: normalizeName(input.positionals.name),
               description: input.options.description,
@@ -788,6 +895,7 @@ export default async function plugin(bb: BbPluginApi) {
               model: input.options.model ?? null,
               reasoningLevel: input.options["reasoning-level"] ?? null,
               permissionMode: input.options["permission-mode"],
+              hostId: machine?.id ?? null,
             });
             if (!parsed.success) {
               throw new PluginCliError(
@@ -800,7 +908,7 @@ export default async function plugin(bb: BbPluginApi) {
               exitCode: 0,
               stdout: input.options.json
                 ? JSON.stringify(saved)
-                : `Saved @${saved.name} [${describeModel(saved)}]`,
+                : `Saved @${saved.name} [${describeModel(saved)}${machine === null ? "" : `, on ${machine.name}`}]`,
             };
           },
         }),
@@ -848,6 +956,12 @@ export default async function plugin(bb: BbPluginApi) {
               description:
                 "Reasoning level for this handoff only; omit to use the specialist's",
             },
+            machine: {
+              type: "string",
+              aliases: ["host"],
+              description:
+                "Machine id or name for this handoff only (see `bb machine list`); omit to use the specialist's, or this thread's",
+            },
             json: jsonOption,
           },
           async run(input, ctx) {
@@ -875,12 +989,17 @@ export default async function plugin(bb: BbPluginApi) {
               ...(model === undefined ? {} : { model }),
               ...(reasoningLevel === undefined ? {} : { reasoningLevel }),
             };
+            const machine =
+              input.options.machine === undefined
+                ? undefined
+                : (await requireMachine(input.options.machine)).id;
             const threadId = await handoff({
               specialist,
               task,
               threadId: ctx.threadId ?? null,
               projectId: ctx.projectId ?? null,
               override,
+              ...(machine === undefined ? {} : { machine }),
             });
             const execution = resolveExecution(specialist, override);
             return {

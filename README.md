@@ -29,6 +29,23 @@ Each specialist also has a permission mode: `full` (the default), `auto`, or
 `accept-edits`. It sets what the specialist's thread may do without asking. Set
 it in the dialog's **Permissions** picker or with `--permission-mode`.
 
+## Pinning a specialist to a machine
+
+With more than one machine enrolled, a specialist can run on a specific one.
+Pick it in the dialog's **Machine** field or pass `--machine <id-or-name>` to
+`bb specialists add`. With no machine it runs on the requester's machine.
+
+To send one handoff elsewhere, ask for it in the message ("ask the @reviewer,
+on the Studio machine, to …"). The tool takes an optional `machine`, the CLI
+takes `--machine`, and the `specialists_handoff` RPCs take `machine`. It
+accepts a machine id or an unambiguous name (see `bb machine list`).
+
+When the specialist's machine is the requester's, it shares the requester's
+workspace as usual. On another machine it gets a fresh workspace of the same
+kind there: a personal workspace, a worktree of the default branch, or the
+project's checkout on that machine. It does not see the requester's
+uncommitted changes, and the project needs a source on that machine.
+
 ## What a mention does
 
 1. The `@` menu in the composer lists specialists under **Specialists**.
@@ -40,7 +57,7 @@ it in the dialog's **Permissions** picker or with `--permission-mode`.
 4. The plugin spawns a child thread on the specialist's model. Its first
    message is the specialist's prompt followed by the task.
 5. The child thread reuses the mentioning thread's environment, so it sees the
-   same files and uncommitted changes.
+   same files and uncommitted changes, unless it runs on another machine.
 6. BB notifies the parent thread when the child finishes. The parent reads the
    result and relays it.
 

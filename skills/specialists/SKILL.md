@@ -34,6 +34,11 @@ A mention is a request to delegate. Do not do the mentioned work yourself.
    request, pass `model`, `provider`, or `reasoningLevel` to the tool (CLI:
    `--model`, `--provider`, `--reasoning-level`). The change applies to that one
    handoff. Never change the model on your own.
+   Likewise it runs on its configured machine, or this thread's when it has
+   none. Only when the user names a machine for this request, pass `machine`
+   (CLI: `--machine`), as an id or name from `bb machine list`. On another
+   machine the specialist gets a fresh workspace and does not see this
+   thread's uncommitted changes, so put what it needs in the brief.
 4. Tell the user which thread took the work, as `@thread:<id>`.
 5. You are notified when the child thread finishes. Read its result with
    `bb thread output <id>` and relay it.
@@ -43,9 +48,9 @@ A mention is a request to delegate. Do not do the mentioned work yourself.
 ```
 bb specialists list [--json]
 bb specialists show <name> [--json]
-bb specialists add <name> --prompt <text> [--description <text>] [--provider <id>] [--model <id>] [--reasoning-level <level>] [--permission-mode full|auto|accept-edits]
+bb specialists add <name> --prompt <text> [--description <text>] [--provider <id>] [--model <id>] [--reasoning-level <level>] [--permission-mode full|auto|accept-edits] [--machine <id-or-name>]
 bb specialists remove <name>
-bb specialists handoff <name> --task <brief> [--provider <id>] [--model <id>] [--reasoning-level <level>]
+bb specialists handoff <name> --task <brief> [--provider <id>] [--model <id>] [--reasoning-level <level>] [--machine <id-or-name>]
 ```
 
 - Names are lowercase letters, digits, and dashes, up to 32 characters. A

@@ -53,6 +53,21 @@ function useSpecialists() {
   return { rpc, specialists, error, setError, refetch };
 }
 
+type Machine = { id: string; name: string };
+
+/** Enrolled machines, for the picker and the row labels. */
+function useMachines(): Machine[] {
+  const rpc = useRpc<typeof rpcContract>();
+  const [machines, setMachines] = useState<Machine[]>([]);
+  useEffect(() => {
+    rpc.call("machines_list").then(
+      (result) => setMachines(result.machines),
+      () => {},
+    );
+  }, [rpc]);
+  return machines;
+}
+
 function pickerValue(
   specialist: Specialist,
 ): ExperimentalProviderModelPickerValue | null {
@@ -103,6 +118,10 @@ function SpecialistDialog({
   const [permissionMode, setPermissionMode] = useState<
     Specialist["permissionMode"]
   >(editing?.permissionMode ?? "full");
+  const [hostId, setHostId] = useState<string | null>(
+    editing?.hostId ?? null,
+  );
+  const machines = useMachines();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -142,6 +161,7 @@ function SpecialistDialog({
           model: model?.model ?? null,
           reasoningLevel: reasoningLevel satisfies StoredReasoningLevel | null,
           permissionMode,
+          hostId,
         },
         replaces: editing?.name ?? null,
       });
@@ -228,6 +248,30 @@ function SpecialistDialog({
               What the specialist's thread may do without asking.
             </span>
           </div>
+          <Field
+            label="Machine"
+            hint="Where the specialist's thread runs. On another machine than the requester's, it gets a fresh workspace there."
+          >
+            <select
+              value={hostId ?? ""}
+              onChange={(event) =>
+                setHostId(event.target.value === "" ? null : event.target.value)
+              }
+              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <option value="">Requester's machine</option>
+              {machines.map((machine) => (
+                <option key={machine.id} value={machine.id}>
+                  {machine.name}
+                </option>
+              ))}
+              {hostId !== null &&
+              machines.length > 0 &&
+              !machines.some((machine) => machine.id === hostId) ? (
+                <option value={hostId}>{hostId} (missing)</option>
+              ) : null}
+            </select>
+          </Field>
           {error === null ? null : (
             <p role="alert" className="text-sm text-destructive">
               {error}
@@ -249,10 +293,12 @@ function SpecialistDialog({
 
 function SpecialistRow({
   specialist,
+  machineName,
   onEdit,
   onRemove,
 }: {
   specialist: Specialist;
+  machineName: string | null;
   onEdit: () => void;
   onRemove: () => void;
 }) {
@@ -265,6 +311,11 @@ function SpecialistRow({
           <span className="font-mono text-xs text-muted-foreground">
             {specialist.model ?? "project default model"}
           </span>
+          {machineName === null ? null : (
+            <span className="text-xs text-muted-foreground">
+              on {machineName}
+            </span>
+          )}
         </div>
         {specialist.description === "" ? null : (
           <p className="mt-0.5 text-muted-foreground">
@@ -296,6 +347,7 @@ function SpecialistRow({
 
 function SpecialistsPage() {
   const { rpc, specialists, error, setError } = useSpecialists();
+  const machines = useMachines();
   // undefined: dialog closed. null: creating. Otherwise: editing that one.
   const [dialog, setDialog] = useState<Specialist | null | undefined>(
     undefined,
@@ -341,6 +393,12 @@ function SpecialistsPage() {
                 <SpecialistRow
                   key={specialist.name}
                   specialist={specialist}
+                  machineName={
+                    specialist.hostId === null
+                      ? null
+                      : (machines.find((each) => each.id === specialist.hostId)
+                          ?.name ?? specialist.hostId)
+                  }
                   onEdit={() => setDialog(specialist)}
                   onRemove={() => {
                     rpc
