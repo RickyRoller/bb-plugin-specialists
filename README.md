@@ -10,8 +10,11 @@ ask the @reviewer to look over the unstaged changes
 
 ## Install
 
+Clone the repository, then install it from your checkout:
+
 ```
-bb plugin install ~/development/bb-plugin-specialists
+git clone https://github.com/RickyRoller/bb-plugin-specialists.git
+bb plugin install ./bb-plugin-specialists
 ```
 
 ## Set up a specialist
