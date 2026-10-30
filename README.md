@@ -63,6 +63,10 @@ uncommitted changes, and the project needs a source on that machine.
    same files and uncommitted changes, unless it runs on another machine.
 6. BB notifies the parent thread when the child finishes. The parent reads the
    result and relays it.
+7. For follow-ups, the agent passes the earlier thread's id as the tool's
+   `thread`. The task is sent to that thread instead of a new one, so the
+   specialist keeps its context. Only the thread that handed off can follow up,
+   and only to the same specialist.
 
 ## Overriding the model for one handoff
 

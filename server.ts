@@ -201,6 +201,7 @@ function mentionContext(specialist: Specialist): string {
     "The specialist runs on its own configured model. Only if the user explicitly asks for a different model, provider, or reasoning level for this request, pass it as the tool's `model`, `provider`, or `reasoningLevel` (CLI: `--model`, `--provider`, `--reasoning-level`). Never change it on your own.",
     "It also runs on its configured machine, or this thread's machine if it has none. Only if the user names a machine for this request, pass it as the tool's `machine` (CLI: `--machine`); list machines with `bb machine list`. On another machine the specialist gets a fresh workspace and does not see this one's uncommitted changes.",
     "After handing off, tell the user which thread is working on it, referencing it as @thread:<id>. You are notified when that thread finishes; then read its result with `bb thread output <id>` and relay it.",
+    `If you already handed work to @${specialist.name} in this thread, send this to that same thread by passing its id as the tool's \`thread\`, so it keeps its context.`,
   ].join("\n\n");
 }
 
@@ -419,7 +420,55 @@ export default async function plugin(bb: BbPluginApi) {
     return [
       `Handed off to @${specialist.name} on ${describeModel(execution)} in thread ${threadId} (reference it to the user as @thread:${threadId}).`,
       `You are notified when it finishes. Then read its result with \`bb thread output ${threadId}\` and relay it to the user. Do not do the handed-off work yourself in the meantime.`,
+      `For follow-up work for @${specialist.name}, call specialist_handoff again with \`thread: "${threadId}"\` so it keeps its context. Start a new thread only for unrelated work.`,
     ].join("\n");
+  }
+
+  /** Sends a follow-up task to a thread this caller handed to the specialist. */
+  async function followUp(args: {
+    specialist: Specialist;
+    task: string;
+    threadId: string;
+    callerThreadId: string | null;
+  }): Promise<void> {
+    const { specialist, task, threadId, callerThreadId } = args;
+    const [thread, batch] = await Promise.all([
+      bb.sdk.threads.get({ threadId }),
+      bb.sdk.threads.experimental_listPluginMetadata({
+        pluginId: "specialists",
+        threadIds: [threadId],
+      }),
+    ]);
+    const owner = batch.threads.find((t) => t.threadId === threadId)?.metadata
+      .specialist;
+    if (owner !== specialist.name) {
+      throw new Error(
+        `Thread ${threadId} is not a @${specialist.name} handoff. Omit \`thread\` to start a new one.`,
+      );
+    }
+    if (thread.parentThreadId !== callerThreadId) {
+      throw new Error(
+        `Thread ${threadId} was handed off by another thread. Omit \`thread\` to start a new one.`,
+      );
+    }
+    await bb.sdk.threads.send({
+      threadId,
+      // Queue behind a running turn rather than steer it mid-task.
+      mode: "queue-if-active",
+      input: [
+        {
+          type: "text",
+          text: [
+            `Follow-up task from thread ${callerThreadId}. Keep what you set up and learned so far, and say if any of it changed.`,
+            "## Task",
+            task.trim(),
+            "End with one final message that states your result in full, because that message is what gets reported back.",
+          ].join("\n\n"),
+        },
+      ],
+      ...(callerThreadId === null ? {} : { senderThreadId: callerThreadId }),
+    } as unknown as Parameters<typeof bb.sdk.threads.send>[0]);
+    bb.log.info(`followed up with ${specialist.name}: ${threadId}`);
   }
 
   const handoffDb = bb.storage.database();
@@ -651,7 +700,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "specialist_handoff",
     description:
-      "Hand work off to a specialist agent. Spawns a child thread that runs the specialist on its own model in this thread's workspace (or a fresh one when it runs on another machine), and returns that thread's id. Use it when the user @mentions a specialist or asks for one by name.",
+      "Hand work off to a specialist agent. Spawns a child thread that runs the specialist on its own model in this thread's workspace (or a fresh one when it runs on another machine), and returns that thread's id. Use it when the user @mentions a specialist or asks for one by name. For follow-up work for a specialist you already handed off to, pass that thread's id as `thread` so it keeps its context instead of starting over.",
     presentation: {
       label: {
         pending: "Handing off to specialist",
@@ -701,9 +750,17 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "Only when the user names one: the machine id or name to run this handoff on (see `bb machine list`). Omit to use the specialist's machine, or this thread's.",
         ),
+      thread: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "The id of a thread you already handed off to this specialist. Sends the task there as a follow-up, so it keeps its context (devices, files, findings). Prefer this for follow-ups; omit it to start a new thread for unrelated work. Cannot be combined with model, provider, reasoningLevel or machine.",
+        ),
     }),
     async execute(
-      { specialist: name, task, model, provider, reasoningLevel, machine },
+      { specialist: name, task, model, provider, reasoningLevel, machine, thread },
       { threadId, projectId },
     ) {
       const specialist = await findSpecialist(name);
@@ -720,6 +777,41 @@ export default async function plugin(bb: BbPluginApi) {
         ...(model === undefined ? {} : { model }),
         ...(reasoningLevel === undefined ? {} : { reasoningLevel }),
       };
+      if (thread !== undefined) {
+        if (Object.keys(override).length > 0 || machine !== undefined) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "A follow-up runs on the thread's existing model and machine. Omit model, provider, reasoningLevel and machine, or omit `thread` to start a new handoff.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        try {
+          await followUp({
+            specialist,
+            task,
+            threadId: thread,
+            callerThreadId: threadId,
+          });
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: error instanceof Error ? error.message : String(error),
+              },
+            ],
+            isError: true,
+          };
+        }
+        return [
+          `Sent the follow-up to @${specialist.name} in thread ${thread} (reference it to the user as @thread:${thread}).`,
+          `You are notified when it finishes. Then read its result with \`bb thread output ${thread}\` and relay it to the user. Do not do the handed-off work yourself in the meantime.`,
+        ].join("\n");
+      }
       const childId = await handoff({
         specialist,
         task,

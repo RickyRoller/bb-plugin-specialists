@@ -42,6 +42,10 @@ A mention is a request to delegate. Do not do the mentioned work yourself.
 4. Tell the user which thread took the work, as `@thread:<id>`.
 5. You are notified when the child thread finishes. Read its result with
    `bb thread output <id>` and relay it.
+6. For follow-up work for the same specialist, call `specialist_handoff` again
+   with `thread: "<id>"` of the earlier handoff. The task goes to that thread,
+   so the specialist keeps its context (devices, files, findings). Start a new
+   thread only for unrelated work.
 
 ## Commands
 

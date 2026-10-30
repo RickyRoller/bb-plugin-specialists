@@ -48,7 +48,7 @@
     "vaul": "^1.1.2"
   },
   "scripts": {
-    "test": "node --import tsx --test keyed-handoff.test.ts machine-handoff.test.ts",
+    "test": "node --import tsx --test keyed-handoff.test.ts machine-handoff.test.ts follow-up.test.ts",
     "typecheck": "tsc --noEmit"
   }
 }
