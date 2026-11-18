@@ -26,6 +26,7 @@ async function setup(environment: Record<string, unknown>) {
             id: threadId,
             projectId: "project-1",
             environmentId: "env-1",
+            title: "Settings page UI",
           }),
         spawn: async () =>
           makeThreadResponse({ id: "worker-1", projectId: "project-1" }),
@@ -118,6 +119,16 @@ test("an unknown machine fails the handoff", async () => {
   try {
     await save(null);
     await assert.rejects(handoff("nowhere"), /No machine "nowhere"/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a handoff from a thread is named after the specialist and that thread", async () => {
+  const { host, save, handoff } = await setup({ isWorktree: true });
+  try {
+    await save(null);
+    assert.equal((await handoff()).title, "reviewer - Settings page UI");
   } finally {
     await host.harness.lifecycle.dispose();
   }

@@ -162,7 +162,13 @@ function normalizeName(raw: string): string {
   return raw.trim().replace(/^@/u, "").toLowerCase();
 }
 
-function handoffTitle(specialist: Specialist, task: string): string {
+/** From a thread, "<specialist> - <thread title>"; else the task's first line. */
+function handoffTitle(
+  specialist: Specialist,
+  task: string,
+  parentTitle: string | null,
+): string {
+  if (parentTitle) return `${specialist.name} - ${parentTitle}`;
   const firstLine = task.trim().split("\n", 1)[0] ?? "";
   const summary =
     firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine;
@@ -383,7 +389,7 @@ export default async function plugin(bb: BbPluginApi) {
           ? { reasoningLevel: "explicit" as const }
           : {}),
       },
-      title: handoffTitle(specialist, task),
+      title: handoffTitle(specialist, task, parent?.title?.trim() || null),
       prompt: handoffPrompt(
         specialist,
         task,
